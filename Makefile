@@ -7,18 +7,18 @@ PROTO_LAYER = protocols/wlr-layer-shell-unstable-v1.xml
 PROTO_XDG = $(WAYLAND_PROTOCOLS)/stable/xdg-shell/xdg-shell.xml
 GEN = wlr-layer-shell-unstable-v1-protocol.c wlr-layer-shell-unstable-v1-protocol.h \
       xdg-shell-protocol.c xdg-shell-protocol.h
-OBJ = mini-status-bar.o wlr-layer-shell-unstable-v1-protocol.o xdg-shell-protocol.o
+OBJ = sdwlb.o wlr-layer-shell-unstable-v1-protocol.o xdg-shell-protocol.o
 
-all: mini-status-bar
+all: sdwlb
 
 config.h:
 	cp config.def.h config.h
 
-mini-status-bar: $(OBJ)
+sdwlb: $(OBJ)
 	$(CC) $(LDFLAGS) -o $@ $(OBJ) $(LDLIBS)
 
-mini-status-bar.o: mini-status-bar.c config.h wlr-layer-shell-unstable-v1-protocol.h
-	$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ mini-status-bar.c
+sdwlb.o: sdwlb.c config.h wlr-layer-shell-unstable-v1-protocol.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ sdwlb.c
 
 wlr-layer-shell-unstable-v1-protocol.h: $(PROTO_LAYER)
 	$(WAYLAND_SCANNER) client-header $(PROTO_LAYER) $@
@@ -39,6 +39,6 @@ xdg-shell-protocol.o: xdg-shell-protocol.c xdg-shell-protocol.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ xdg-shell-protocol.c
 
 clean:
-	rm -f mini-status-bar $(OBJ) $(GEN)
+	rm -f sdwlb $(OBJ) $(GEN)
 
 .PHONY: all clean

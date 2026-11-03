@@ -1,4 +1,6 @@
 #include <errno.h>
+#include <fcntl.h>
+#include <linux/input-event-codes.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdint.h>
@@ -16,6 +18,12 @@
 #include "config.h"
 
 #define STATUS_TMP STATUS_FILE ".tmp"
+#define MAX_CLICKABLES 16
+
+struct clickable {
+	int x, y, w, h;
+	const char *cmd;
+};
 
 struct state {
 	struct wl_display *display;
@@ -25,6 +33,8 @@ struct state {
 	struct zwlr_layer_shell_v1 *layer_shell;
 	struct wl_surface *surface;
 	struct zwlr_layer_surface_v1 *layer_surface;
+	struct wl_seat *seat;
+	struct wl_pointer *pointer;
 
 	uint32_t width;
 	uint32_t height;
@@ -32,6 +42,9 @@ struct state {
 	int running;
 	int dirty;
 	int buffer_busy;
+	int pointer_inside;
+	int pointer_x;
+	int pointer_y;
 
 	struct wl_buffer *buffer;
 	uint32_t *pixels;
@@ -46,6 +59,12 @@ struct state {
 	uint64_t cpu_prev_idle;
 	int cpu_usage;
 	int mem_usage;
+	int volume;
+	int muted;
+	int wifi_usage;
+
+	struct clickable clickables[MAX_CLICKABLES];
+	int nclickables;
 
 	char inbuf[8192];
 	size_t inlen;
@@ -63,7 +82,7 @@ sig_handler(int sig)
 static void
 die(const char *msg)
 {
-	fprintf(stderr, "mini-status-bar: %s\n", msg);
+	fprintf(stderr, "sdwlb: %s\n", msg);
 	exit(1);
 }
 
@@ -77,32 +96,47 @@ premultiply(uint32_t color)
 	return (a << 24) | (r << 16) | (g << 8) | b;
 }
 
+static const uint32_t metric_colors[5] = {
+	COL_METRIC_0,
+	COL_METRIC_1,
+	COL_METRIC_2,
+	COL_METRIC_3,
+	COL_METRIC_4,
+};
+
 static uint32_t
-lerp_color(uint32_t a, uint32_t b, int t)
+metric_color(int usage)
 {
-	int aa, ar, ag, ab, ba, br, bg, bb, ca, cr, cg, cb;
+	int i;
 
-	if (t < 0)
-		t = 0;
-	if (t > 255)
-		t = 255;
+	if (usage < 0)
+		usage = 0;
+	if (usage > 100)
+		usage = 100;
 
-	aa = (a >> 24) & 0xff;
-	ar = (a >> 16) & 0xff;
-	ag = (a >> 8) & 0xff;
-	ab = a & 0xff;
-	ba = (b >> 24) & 0xff;
-	br = (b >> 16) & 0xff;
-	bg = (b >> 8) & 0xff;
-	bb = b & 0xff;
+	i = usage * 5 / 100;
+	if (i > 4)
+		i = 4;
 
-	ca = aa + (ba - aa) * t / 255;
-	cr = ar + (br - ar) * t / 255;
-	cg = ag + (bg - ag) * t / 255;
-	cb = ab + (bb - ab) * t / 255;
+	return metric_colors[i];
+}
 
-	return ((uint32_t)ca << 24) | ((uint32_t)cr << 16) |
-	       ((uint32_t)cg << 8) | (uint32_t)cb;
+static void
+add_clickable(struct state *s, int x, int y, int w, int h, const char *cmd)
+{
+	struct clickable *c;
+
+	if (!cmd || !cmd[0] || w <= 0 || h <= 0)
+		return;
+	if (s->nclickables >= MAX_CLICKABLES)
+		return;
+
+	c = &s->clickables[s->nclickables++];
+	c->x = x;
+	c->y = y;
+	c->w = w;
+	c->h = h;
+	c->cmd = cmd;
 }
 
 static void
@@ -208,6 +242,7 @@ draw_clock(struct state *s)
 	time_t now;
 	struct tm tm;
 	int span, minutes, block_minutes, filled, current, total_w, x, h, i;
+	int clock_x, minute_h, top_h, minute_blocks;
 
 	if (CLOCK_BLOCKS <= 0)
 		return;
@@ -233,6 +268,18 @@ draw_clock(struct state *s)
 		x = 0;
 	h = (int)s->height;
 
+	minute_h = CLOCK_MINUTE_H;
+	if (minute_h < 0)
+		minute_h = 0;
+	if (minute_h > h)
+		minute_h = h;
+	top_h = h - minute_h;
+
+	minute_blocks = tm.tm_min * CLOCK_BLOCKS / 60;
+	if (minute_blocks > CLOCK_BLOCKS)
+		minute_blocks = CLOCK_BLOCKS;
+
+	clock_x = x;
 	for (i = 0; i < CLOCK_BLOCKS; i++) {
 		uint32_t color;
 
@@ -243,30 +290,171 @@ draw_clock(struct state *s)
 		else
 			color = COL_CLOCK_EMPTY;
 
-		fill_rect(s, x, 0, CLOCK_BLOCK_W, h, color);
+		fill_rect(s, x, 0, CLOCK_BLOCK_W, top_h, color);
+		if (minute_h > 0) {
+			fill_rect(s, x, top_h, CLOCK_BLOCK_W, minute_h,
+			          COL_CLOCK_EMPTY);
+			if (i < minute_blocks)
+				fill_rect(s, x, top_h, CLOCK_BLOCK_W, minute_h,
+				          COL_CLOCK_MINUTE);
+		}
 		x += CLOCK_BLOCK_W + BLOCK_GAP;
 	}
+
+	add_clickable(s, clock_x, 0, total_w, h, CLOCK_CMD);
+}
+
+static int
+sound_width(void)
+{
+	if (SOUND_BLOCKS <= 0 || SOUND_BLOCK_W <= 0)
+		return 0;
+	return SOUND_BLOCKS * SOUND_BLOCK_W +
+	       (SOUND_BLOCKS - 1) * RIGHT_BLOCK_GAP;
+}
+
+static int
+wifi_width(void)
+{
+	if (WIFI_BLOCKS <= 0 || WIFI_BLOCK_W <= 0)
+		return 0;
+	return WIFI_BLOCKS * WIFI_BLOCK_W +
+	       (WIFI_BLOCKS - 1) * RIGHT_BLOCK_GAP;
+}
+
+static int
+draw_sound(struct state *s, int x)
+{
+	int h = (int)s->height;
+	int width = sound_width();
+	int start = x;
+	int lit, i;
+	uint32_t on, off;
+
+	if (width <= 0)
+		return x;
+
+	if (s->muted) {
+		on = COL_SOUND_MUTED;
+		off = COL_SOUND_MUTED;
+		lit = SOUND_BLOCKS;
+	} else {
+		on = COL_SOUND_ON;
+		off = COL_SOUND_OFF;
+		lit = s->volume * SOUND_BLOCKS / 100;
+	}
+	if (lit < 0)
+		lit = 0;
+	if (lit > SOUND_BLOCKS)
+		lit = SOUND_BLOCKS;
+
+	for (i = 0; i < SOUND_BLOCKS; i++) {
+		fill_rect(s, x, 0, SOUND_BLOCK_W, h, i < lit ? on : off);
+		x += SOUND_BLOCK_W + RIGHT_BLOCK_GAP;
+	}
+
+	add_clickable(s, start, 0, width, h, SOUND_CMD);
+	return start + width;
+}
+
+static int
+draw_wifi(struct state *s, int x)
+{
+	int h = (int)s->height;
+	int width = wifi_width();
+	int start = x;
+	int lit, i;
+
+	if (width <= 0)
+		return x;
+
+	lit = s->wifi_usage * WIFI_BLOCKS / 100;
+	if (lit < 0)
+		lit = 0;
+	if (lit > WIFI_BLOCKS)
+		lit = WIFI_BLOCKS;
+
+	for (i = 0; i < WIFI_BLOCKS; i++) {
+		fill_rect(s, x, 0, WIFI_BLOCK_W, h,
+		          i < lit ? COL_WIFI_ON : COL_WIFI_OFF);
+		x += WIFI_BLOCK_W + RIGHT_BLOCK_GAP;
+	}
+
+	add_clickable(s, start, 0, width, h, WIFI_CMD);
+	return start + width;
+}
+
+static int
+draw_metric(struct state *s, int x, int usage, const char *cmd)
+{
+	int h = (int)s->height;
+
+	if (METRIC_BLOCK_W <= 0)
+		return x;
+
+	fill_rect(s, x, 0, METRIC_BLOCK_W, h, metric_color(usage));
+	add_clickable(s, x, 0, METRIC_BLOCK_W, h, cmd);
+	return x + METRIC_BLOCK_W;
+}
+
+static int
+draw_custom(struct state *s, int x)
+{
+	int h = (int)s->height;
+
+	if (CUSTOM_BLOCK_W <= 0)
+		return x;
+
+	fill_rect(s, x, 0, CUSTOM_BLOCK_W, h, COL_CUSTOM);
+	add_clickable(s, x, 0, CUSTOM_BLOCK_W, h, CUSTOM_CMD);
+	return x + CUSTOM_BLOCK_W;
 }
 
 static void
-draw_metrics(struct state *s)
+draw_right(struct state *s)
 {
-	int h = (int)s->height;
-	int total_w = METRIC_BLOCK_W * 2 + BLOCK_GAP;
-	int x = (int)s->width - BAR_PADDING - total_w;
-	uint32_t cpu, mem;
+	int sw = sound_width();
+	int ww = wifi_width();
+	int mw = METRIC_BLOCK_W > 0 ? METRIC_BLOCK_W : 0;
+	int cw = CUSTOM_BLOCK_W > 0 ? CUSTOM_BLOCK_W : 0;
+	int groups = 0;
+	int total_w, x;
 
+	if (sw > 0)
+		groups++;
+	if (ww > 0)
+		groups++;
+	if (mw > 0)
+		groups += 2;
+	if (cw > 0)
+		groups++;
+
+	total_w = sw + ww + mw * 2 + cw;
+	if (groups > 1)
+		total_w += (groups - 1) * RIGHT_MODULE_GAP;
+
+	x = (int)s->width - BAR_PADDING - total_w;
 	if (x < 0)
 		x = 0;
 
-	cpu = lerp_color(COL_CPU_LOW, COL_CPU_HIGH,
-	                 s->cpu_usage * 255 / 100);
-	mem = lerp_color(COL_MEM_LOW, COL_MEM_HIGH,
-	                 s->mem_usage * 255 / 100);
-
-	fill_rect(s, x, 0, METRIC_BLOCK_W, h, cpu);
-	x += METRIC_BLOCK_W + BLOCK_GAP;
-	fill_rect(s, x, 0, METRIC_BLOCK_W, h, mem);
+	if (sw > 0) {
+		x = draw_sound(s, x);
+		x += RIGHT_MODULE_GAP;
+	}
+	if (ww > 0) {
+		x = draw_wifi(s, x);
+		x += RIGHT_MODULE_GAP;
+	}
+	if (mw > 0) {
+		x = draw_metric(s, x, s->cpu_usage, CPU_CMD);
+		x += RIGHT_MODULE_GAP;
+	}
+	if (mw > 0) {
+		x = draw_metric(s, x, s->mem_usage, MEM_CMD);
+		x += RIGHT_MODULE_GAP;
+	}
+	if (cw > 0)
+		draw_custom(s, x);
 }
 
 static void
@@ -275,11 +463,12 @@ draw(struct state *s)
 	if (!s->configured || !s->buffer || s->buffer_busy)
 		return;
 
+	s->nclickables = 0;
 	memset(s->pixels, 0, s->pixels_size);
 	fill_rect(s, 0, 0, (int)s->width, (int)s->height, COL_BG);
 	draw_tags(s);
 	draw_clock(s);
-	draw_metrics(s);
+	draw_right(s);
 
 	wl_surface_attach(s->surface, s->buffer, 0, 0);
 	wl_surface_damage(s->surface, 0, 0,
@@ -369,6 +558,114 @@ read_mem_usage(void)
 		usage = 100;
 
 	return usage;
+}
+
+static void
+read_volume(struct state *s)
+{
+	FILE *p;
+	char line[512];
+	int volume = -1, muted = -1;
+
+	p = popen("amixer sget Master < /dev/null 2>/dev/null", "r");
+	if (!p)
+		return;
+
+	while (fgets(line, sizeof line, p)) {
+		char *pct;
+		int value;
+
+		if (!strstr(line, "Playback"))
+			continue;
+
+		pct = strchr(line, '[');
+		if (pct && sscanf(pct, "[%d%%", &value) == 1)
+			volume = value;
+
+		if (strstr(line, "[off]"))
+			muted = 1;
+		else if (strstr(line, "[on]"))
+			muted = 0;
+	}
+	pclose(p);
+
+	if (volume >= 0) {
+		if (volume > 100)
+			volume = 100;
+		s->volume = volume;
+	}
+	if (muted >= 0)
+		s->muted = muted;
+}
+
+static void
+read_wifi(struct state *s)
+{
+	FILE *f;
+	char line[256];
+	char iface[64];
+	unsigned int status;
+	float link, level, noise;
+	int pct = 0;
+	int i;
+
+	f = fopen("/proc/net/wireless", "r");
+	if (!f) {
+		s->wifi_usage = 0;
+		return;
+	}
+
+	for (i = 0; i < 2; i++) {
+		if (!fgets(line, sizeof line, f)) {
+			fclose(f);
+			s->wifi_usage = 0;
+			return;
+		}
+	}
+
+	if (fgets(line, sizeof line, f)) {
+		if (sscanf(line, " %63[^:]: %x %f %f %f",
+		           iface, &status, &link, &level, &noise) >= 4) {
+			if (level > -50)
+				pct = 100;
+			else if (level < -100)
+				pct = 0;
+			else
+				pct = (int)((level + 100) * 2);
+
+			if (pct < 0)
+				pct = 0;
+			if (pct > 100)
+				pct = 100;
+		}
+	}
+
+	fclose(f);
+	s->wifi_usage = pct;
+}
+
+static void
+spawn(const char *cmd)
+{
+	pid_t pid;
+
+	if (!cmd || !cmd[0])
+		return;
+
+	pid = fork();
+	if (pid < 0)
+		return;
+	if (pid == 0) {
+		int fd = open("/dev/null", O_RDONLY);
+
+		if (fd >= 0) {
+			dup2(fd, STDIN_FILENO);
+			if (fd != STDIN_FILENO)
+				close(fd);
+		}
+		execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+		_exit(127);
+	}
 }
 
 static void
@@ -518,7 +815,7 @@ create_buffer(struct state *s)
 	stride = (int)s->width * 4;
 	size = (size_t)stride * s->height;
 
-	fd = memfd_create("mini-status-bar", MFD_CLOEXEC);
+	fd = memfd_create("sdwlb", MFD_CLOEXEC);
 	if (fd < 0)
 		die("memfd_create");
 
@@ -599,6 +896,119 @@ static const struct zwlr_layer_surface_v1_listener layer_surface_listener = {
 };
 
 static void
+handle_click(struct state *s)
+{
+	int i;
+
+	for (i = s->nclickables - 1; i >= 0; i--) {
+		struct clickable *c = &s->clickables[i];
+
+		if (s->pointer_x >= c->x && s->pointer_x < c->x + c->w &&
+		    s->pointer_y >= c->y && s->pointer_y < c->y + c->h) {
+			spawn(c->cmd);
+			break;
+		}
+	}
+}
+
+static void
+pointer_enter(void *data, struct wl_pointer *pointer, uint32_t serial,
+              struct wl_surface *surface, wl_fixed_t sx, wl_fixed_t sy)
+{
+	struct state *s = data;
+
+	(void)pointer;
+	(void)serial;
+	if (surface != s->surface)
+		return;
+
+	s->pointer_inside = 1;
+	s->pointer_x = wl_fixed_to_int(sx);
+	s->pointer_y = wl_fixed_to_int(sy);
+}
+
+static void
+pointer_leave(void *data, struct wl_pointer *pointer, uint32_t serial,
+              struct wl_surface *surface)
+{
+	struct state *s = data;
+
+	(void)pointer;
+	(void)serial;
+	(void)surface;
+	s->pointer_inside = 0;
+}
+
+static void
+pointer_motion(void *data, struct wl_pointer *pointer, uint32_t time,
+               wl_fixed_t sx, wl_fixed_t sy)
+{
+	struct state *s = data;
+
+	(void)pointer;
+	(void)time;
+	if (!s->pointer_inside)
+		return;
+
+	s->pointer_x = wl_fixed_to_int(sx);
+	s->pointer_y = wl_fixed_to_int(sy);
+}
+
+static void
+pointer_button(void *data, struct wl_pointer *pointer, uint32_t serial,
+               uint32_t time, uint32_t button, uint32_t state)
+{
+	struct state *s = data;
+
+	(void)pointer;
+	(void)serial;
+	(void)time;
+	if (state == WL_POINTER_BUTTON_STATE_PRESSED &&
+	    button == BTN_LEFT && s->pointer_inside)
+		handle_click(s);
+}
+
+static void
+pointer_axis(void *data, struct wl_pointer *pointer, uint32_t time,
+             uint32_t axis, wl_fixed_t value)
+{
+	(void)data;
+	(void)pointer;
+	(void)time;
+	(void)axis;
+	(void)value;
+}
+
+static const struct wl_pointer_listener pointer_listener = {
+	.enter = pointer_enter,
+	.leave = pointer_leave,
+	.motion = pointer_motion,
+	.button = pointer_button,
+	.axis = pointer_axis,
+};
+
+static void
+seat_capabilities(void *data, struct wl_seat *seat, uint32_t capabilities)
+{
+	struct state *s = data;
+
+	if ((capabilities & WL_SEAT_CAPABILITY_POINTER) && !s->pointer) {
+		s->pointer = wl_seat_get_pointer(seat);
+		if (s->pointer)
+			wl_pointer_add_listener(s->pointer, &pointer_listener, s);
+	} else if (!(capabilities & WL_SEAT_CAPABILITY_POINTER) &&
+	           s->pointer) {
+		wl_pointer_destroy(s->pointer);
+		s->pointer = NULL;
+		s->pointer_inside = 0;
+	}
+}
+
+static const struct wl_seat_listener seat_listener = {
+	.capabilities = seat_capabilities,
+};
+
+static void
 registry_global(void *data, struct wl_registry *registry, uint32_t name,
                 const char *interface, uint32_t version)
 {
@@ -616,6 +1026,12 @@ registry_global(void *data, struct wl_registry *registry, uint32_t name,
 		s->layer_shell = wl_registry_bind(registry, name,
 		                                  &zwlr_layer_shell_v1_interface,
 		                                  1);
+	else if (strcmp(interface, wl_seat_interface.name) == 0) {
+		s->seat = wl_registry_bind(registry, name,
+		                           &wl_seat_interface, 1);
+		if (s->seat)
+			wl_seat_add_listener(s->seat, &seat_listener, s);
+	}
 }
 
 static void
@@ -648,10 +1064,12 @@ main(void)
 	sa.sa_flags = 0;
 	sigaction(SIGINT, &sa, NULL);
 	sigaction(SIGTERM, &sa, NULL);
+	signal(SIGCHLD, SIG_IGN);
 
 	s.display = wl_display_connect(NULL);
 	if (!s.display)
 		die("wl_display_connect");
+	fcntl(wl_display_get_fd(s.display), F_SETFD, FD_CLOEXEC);
 
 	s.registry = wl_display_get_registry(s.display);
 	wl_registry_add_listener(s.registry, &registry_listener, &s);
@@ -666,7 +1084,7 @@ main(void)
 
 	s.layer_surface = zwlr_layer_shell_v1_get_layer_surface(
 	    s.layer_shell, s.surface, NULL,
-	    ZWLR_LAYER_SHELL_V1_LAYER_TOP, "mini-status-bar");
+	    ZWLR_LAYER_SHELL_V1_LAYER_TOP, "sdwlb");
 	if (!s.layer_surface)
 		die("zwlr_layer_shell_v1_get_layer_surface");
 
@@ -693,6 +1111,8 @@ main(void)
 
 	s.cpu_usage = read_cpu_usage(&s);
 	s.mem_usage = read_mem_usage();
+	read_volume(&s);
+	read_wifi(&s);
 
 	while (s.running && sig_running) {
 		struct pollfd fds[2];
@@ -733,6 +1153,8 @@ main(void)
 		if (ret == 0) {
 			s.cpu_usage = read_cpu_usage(&s);
 			s.mem_usage = read_mem_usage();
+			read_volume(&s);
+			read_wifi(&s);
 			s.dirty = 1;
 		}
 
@@ -741,6 +1163,10 @@ main(void)
 	}
 
 	destroy_buffer(&s);
+	if (s.pointer)
+		wl_pointer_destroy(s.pointer);
+	if (s.seat)
+		wl_seat_destroy(s.seat);
 	if (s.layer_surface)
 		zwlr_layer_surface_v1_destroy(s.layer_surface);
 	if (s.surface)
