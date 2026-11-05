@@ -96,31 +96,6 @@ premultiply(uint32_t color)
 	return (a << 24) | (r << 16) | (g << 8) | b;
 }
 
-static const uint32_t metric_colors[5] = {
-	COL_METRIC_0,
-	COL_METRIC_1,
-	COL_METRIC_2,
-	COL_METRIC_3,
-	COL_METRIC_4,
-};
-
-static uint32_t
-metric_color(int usage)
-{
-	int i;
-
-	if (usage < 0)
-		usage = 0;
-	if (usage > 100)
-		usage = 100;
-
-	i = usage * 5 / 100;
-	if (i > 4)
-		i = 4;
-
-	return metric_colors[i];
-}
-
 static void
 add_clickable(struct state *s, int x, int y, int w, int h, const char *cmd)
 {
@@ -307,10 +282,7 @@ draw_clock(struct state *s)
 static int
 sound_width(void)
 {
-	if (SOUND_BLOCKS <= 0 || SOUND_BLOCK_W <= 0)
-		return 0;
-	return SOUND_BLOCKS * SOUND_BLOCK_W +
-	       (SOUND_BLOCKS - 1) * RIGHT_BLOCK_GAP;
+	return SOUND_BAR_W;
 }
 
 static int
@@ -327,31 +299,25 @@ draw_sound(struct state *s, int x)
 {
 	int h = (int)s->height;
 	int width = sound_width();
+	int fill_w;
 	int start = x;
-	int lit, i;
-	uint32_t on, off;
 
 	if (width <= 0)
 		return x;
 
-	if (s->muted) {
-		on = COL_SOUND_MUTED;
-		off = COL_SOUND_MUTED;
-		lit = SOUND_BLOCKS;
-	} else {
-		on = COL_SOUND_ON;
-		off = COL_SOUND_OFF;
-		lit = s->volume * SOUND_BLOCKS / 100;
-	}
-	if (lit < 0)
-		lit = 0;
-	if (lit > SOUND_BLOCKS)
-		lit = SOUND_BLOCKS;
+	/* Fondo de la barra */
+	fill_rect(s, x, 0, width, h, COL_SOUND_BG);
 
-	for (i = 0; i < SOUND_BLOCKS; i++) {
-		fill_rect(s, x, 0, SOUND_BLOCK_W, h, i < lit ? on : off);
-		x += SOUND_BLOCK_W + RIGHT_BLOCK_GAP;
-	}
+	/* Relleno continuo proporcional al volumen */
+	fill_w = s->volume * width / 100;
+	if (fill_w < 0)
+		fill_w = 0;
+	if (fill_w > width)
+		fill_w = width;
+
+	if (fill_w > 0)
+		fill_rect(s, x, 0, fill_w, h,
+			s->muted ? COL_SOUND_MUTED : COL_SOUND_FG);
 
 	add_clickable(s, start, 0, width, h, SOUND_CMD);
 	return start + width;
@@ -385,16 +351,51 @@ draw_wifi(struct state *s, int x)
 }
 
 static int
-draw_metric(struct state *s, int x, int usage, const char *cmd)
+draw_metric(struct state *s, int x, int usage, uint32_t color,
+            const char *cmd)
 {
 	int h = (int)s->height;
+	int seg_w, i, filled;
+	int total_w = METRIC_BLOCK_W;
+	int high;
 
-	if (METRIC_BLOCK_W <= 0)
+	if (total_w <= 0)
 		return x;
 
-	fill_rect(s, x, 0, METRIC_BLOCK_W, h, metric_color(usage));
-	add_clickable(s, x, 0, METRIC_BLOCK_W, h, cmd);
-	return x + METRIC_BLOCK_W;
+	if (usage < 0)
+		usage = 0;
+	if (usage > 100)
+		usage = 100;
+
+	high = usage >= 100;
+
+	seg_w = (total_w - (METRIC_SEGMENTS - 1) * METRIC_SEG_GAP) /
+	        METRIC_SEGMENTS;
+	if (seg_w <= 0)
+		seg_w = total_w / METRIC_SEGMENTS;
+
+	/* Redondeo hacia arriba: cualquier uso > 0% muestra al menos 1 segmento */
+	filled = (usage * METRIC_SEGMENTS + 99) / 100;
+	if (filled > METRIC_SEGMENTS)
+		filled = METRIC_SEGMENTS;
+
+	/* Fondo de las 5 barritas (vacías) para que la estructura se vea */
+	for (i = 0; i < METRIC_SEGMENTS; i++) {
+		int sx = x + i * (seg_w + METRIC_SEG_GAP);
+		fill_rect(s, sx, 0, seg_w, h, COL_METRIC_EMPTY);
+	}
+
+	/* Segmentos llenados */
+	for (i = 0; i < METRIC_SEGMENTS; i++) {
+		int sx = x + i * (seg_w + METRIC_SEG_GAP);
+
+		if (i < filled)
+			fill_rect(s, sx, 0, seg_w, h,
+				high ? COL_METRIC_HIGH : color);
+	}
+
+	add_clickable(s, x, 0, total_w, h, cmd);
+	return x + total_w;
 }
 
 static int
@@ -446,11 +447,11 @@ draw_right(struct state *s)
 		x += RIGHT_MODULE_GAP;
 	}
 	if (mw > 0) {
-		x = draw_metric(s, x, s->cpu_usage, CPU_CMD);
+		x = draw_metric(s, x, s->cpu_usage, COL_CPU, CPU_CMD);
 		x += RIGHT_MODULE_GAP;
 	}
 	if (mw > 0) {
-		x = draw_metric(s, x, s->mem_usage, MEM_CMD);
+		x = draw_metric(s, x, s->mem_usage, COL_MEM, MEM_CMD);
 		x += RIGHT_MODULE_GAP;
 	}
 	if (cw > 0)
