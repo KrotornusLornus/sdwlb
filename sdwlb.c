@@ -19,6 +19,7 @@
 
 #define STATUS_TMP STATUS_FILE ".tmp"
 #define MAX_CLICKABLES 16
+#define MAX_OUTPUTS 16
 
 struct clickable {
 	int x, y, w, h;
@@ -40,6 +41,9 @@ struct state {
 	uint32_t height;
 	int configured;
 	int running;
+	int ready;
+	int recreate;
+	int output_count;
 	int dirty;
 	int buffer_busy;
 	int pointer_inside;
@@ -65,6 +69,8 @@ struct state {
 
 	struct clickable clickables[MAX_CLICKABLES];
 	int nclickables;
+
+	uint32_t output_names[MAX_OUTPUTS];
 
 	char inbuf[8192];
 	size_t inlen;
@@ -888,7 +894,19 @@ layer_surface_closed(void *data, struct zwlr_layer_surface_v1 *surface)
 	struct state *s = data;
 
 	(void)surface;
-	s->running = 0;
+	destroy_buffer(s);
+	if (s->layer_surface) {
+		zwlr_layer_surface_v1_destroy(s->layer_surface);
+		s->layer_surface = NULL;
+	}
+	if (s->surface) {
+		wl_surface_destroy(s->surface);
+		s->surface = NULL;
+	}
+	s->configured = 0;
+	s->dirty = 0;
+	s->pointer_inside = 0;
+	s->recreate = 1;
 }
 
 static const struct zwlr_layer_surface_v1_listener layer_surface_listener = {
@@ -1009,11 +1027,62 @@ static const struct wl_seat_listener seat_listener = {
 	.capabilities = seat_capabilities,
 };
 
+static int
+create_layer_surface(struct state *s)
+{
+	uint32_t anchor;
+
+	if (s->surface || !s->compositor || !s->shm || !s->layer_shell)
+		return 0;
+
+	destroy_buffer(s);
+
+	s->surface = wl_compositor_create_surface(s->compositor);
+	if (!s->surface)
+		return 0;
+
+	s->layer_surface = zwlr_layer_shell_v1_get_layer_surface(
+	    s->layer_shell, s->surface, NULL,
+	    ZWLR_LAYER_SHELL_V1_LAYER_TOP, "sdwlb");
+	if (!s->layer_surface) {
+		wl_surface_destroy(s->surface);
+		s->surface = NULL;
+		return 0;
+	}
+
+	zwlr_layer_surface_v1_add_listener(s->layer_surface,
+	                                   &layer_surface_listener, s);
+
+	anchor = ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT |
+	         ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT;
+#if BAR_POSITION
+	anchor |= ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM;
+#else
+	anchor |= ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP;
+#endif
+
+	zwlr_layer_surface_v1_set_anchor(s->layer_surface, anchor);
+	zwlr_layer_surface_v1_set_size(s->layer_surface, 0, BAR_HEIGHT);
+	zwlr_layer_surface_v1_set_exclusive_zone(s->layer_surface, BAR_HEIGHT);
+	zwlr_layer_surface_v1_set_keyboard_interactivity(
+	    s->layer_surface,
+	    ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE);
+
+	s->configured = 0;
+	s->dirty = 0;
+	s->recreate = 0;
+	wl_surface_commit(s->surface);
+	wl_display_flush(s->display);
+
+	return 1;
+}
+
 static void
 registry_global(void *data, struct wl_registry *registry, uint32_t name,
                 const char *interface, uint32_t version)
 {
 	struct state *s = data;
+	int i;
 
 	(void)version;
 
@@ -1032,15 +1101,34 @@ registry_global(void *data, struct wl_registry *registry, uint32_t name,
 		                           &wl_seat_interface, 1);
 		if (s->seat)
 			wl_seat_add_listener(s->seat, &seat_listener, s);
+	} else if (strcmp(interface, wl_output_interface.name) == 0) {
+		for (i = 0; i < s->output_count; i++) {
+			if (s->output_names[i] == name)
+				return;
+		}
+		if (s->output_count < MAX_OUTPUTS)
+			s->output_names[s->output_count++] = name;
+		if (s->ready && s->output_count > 0 && !s->surface) {
+			if (!create_layer_surface(s))
+				s->recreate = 1;
+		}
 	}
 }
 
 static void
 registry_global_remove(void *data, struct wl_registry *registry, uint32_t name)
 {
-	(void)data;
+	struct state *s = data;
+	int i;
+
 	(void)registry;
-	(void)name;
+	for (i = 0; i < s->output_count; i++) {
+		if (s->output_names[i] == name) {
+			s->output_names[i] =
+			    s->output_names[--s->output_count];
+			break;
+		}
+	}
 }
 
 static const struct wl_registry_listener registry_listener = {
@@ -1053,7 +1141,6 @@ main(void)
 {
 	struct state s;
 	struct sigaction sa;
-	uint32_t anchor;
 
 	memset(&s, 0, sizeof s);
 	s.running = 1;
@@ -1079,36 +1166,13 @@ main(void)
 	if (!s.compositor || !s.shm || !s.layer_shell)
 		die("missing wayland globals");
 
-	s.surface = wl_compositor_create_surface(s.compositor);
-	if (!s.surface)
-		die("wl_compositor_create_surface");
-
-	s.layer_surface = zwlr_layer_shell_v1_get_layer_surface(
-	    s.layer_shell, s.surface, NULL,
-	    ZWLR_LAYER_SHELL_V1_LAYER_TOP, "sdwlb");
-	if (!s.layer_surface)
-		die("zwlr_layer_shell_v1_get_layer_surface");
-
-	zwlr_layer_surface_v1_add_listener(s.layer_surface,
-	                                   &layer_surface_listener, &s);
-
-	anchor = ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT |
-	         ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT;
-#if BAR_POSITION
-	anchor |= ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM;
-#else
-	anchor |= ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP;
-#endif
-
-	zwlr_layer_surface_v1_set_anchor(s.layer_surface, anchor);
-	zwlr_layer_surface_v1_set_size(s.layer_surface, 0, BAR_HEIGHT);
-	zwlr_layer_surface_v1_set_exclusive_zone(s.layer_surface, BAR_HEIGHT);
-	zwlr_layer_surface_v1_set_keyboard_interactivity(
-	    s.layer_surface,
-	    ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE);
-
-	wl_surface_commit(s.surface);
-	wl_display_flush(s.display);
+	s.ready = 1;
+	if (s.output_count > 0) {
+		if (!create_layer_surface(&s))
+			die("create_layer_surface");
+	} else {
+		s.recreate = 1;
+	}
 
 	s.cpu_usage = read_cpu_usage(&s);
 	s.mem_usage = read_mem_usage();
@@ -1152,6 +1216,8 @@ main(void)
 			handle_stdin(&s);
 
 		if (ret == 0) {
+			if (s.recreate && s.output_count > 0 && !s.surface)
+				create_layer_surface(&s);
 			s.cpu_usage = read_cpu_usage(&s);
 			s.mem_usage = read_mem_usage();
 			read_volume(&s);
